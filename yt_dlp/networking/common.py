@@ -510,6 +510,7 @@ class Request:
 
 
 HEADRequest = functools.partial(Request, method='HEAD')
+PATCHRequest = functools.partial(Request, method='PATCH')
 PUTRequest = functools.partial(Request, method='PUT')
 
 
