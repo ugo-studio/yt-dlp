@@ -8,7 +8,6 @@ import io
 import typing
 import urllib.parse
 import urllib.request
-import urllib.response
 from collections.abc import Iterable, Mapping
 from email.message import Message
 from http import HTTPStatus
@@ -16,6 +15,7 @@ from types import NoneType
 
 from ._helper import make_ssl_context, wrap_request_errors
 from .exceptions import (
+    HTTPError,
     NoSupportingHandlers,
     RequestError,
     TransportError,
@@ -59,14 +59,16 @@ class RequestDirector:
 
     @param logger: Logger instance.
     @param verbose: Print debug request information to stdout.
+    @param cookiejar: Cookiejar to use for resolving cookies when url_prefix is set.
     """
 
-    def __init__(self, logger, url_prefix=None, verbose=False):
+    def __init__(self, logger, url_prefix=None, verbose=False, cookiejar=None):
         self.handlers: dict[str, RequestHandler] = {}
         self.preferences: set[Preference] = set()
         self.logger = logger  # TODO(Grub4k): default logger
         self.url_prefix = url_prefix
         self.verbose = verbose
+        self.cookiejar = cookiejar
 
     def close(self):
         for handler in self.handlers.values():
@@ -92,6 +94,65 @@ class RequestDirector:
         if self.verbose:
             self.logger.stdout(f'director: {msg}')
 
+    @staticmethod
+    def _strip_url_prefix(url, prefix):
+        if prefix and url and url.startswith(prefix):
+            return url[len(prefix):]
+        return url
+
+    def _prepare_url_prefix(self, request: Request):
+        """
+        Apply url_prefix to the request URL while preserving cookie domain matching.
+
+        Cookies are resolved against the original URL before the prefix is applied,
+        and a dummy cookiejar is set to prevent handlers from matching against the
+        prefixed (proxy) domain. Response cookies are extracted afterwards in
+        _restore_url_prefix().
+        """
+        if not self.url_prefix:
+            return
+
+        original_url = request.url
+        cookiejar = request.extensions.get('cookiejar') or self.cookiejar
+
+        # Resolve cookies against the original URL and set them as a Cookie header
+        if cookiejar and 'cookie' not in request.headers:
+            cookie_header = cookiejar.get_cookie_header(original_url)
+            if cookie_header:
+                request.headers['Cookie'] = cookie_header
+
+        # Prevent handlers from using their own cookiejar (which would match
+        # against the prefixed/proxy domain instead of the original domain)
+        request.extensions['cookiejar'] = YoutubeDLCookieJar()
+
+        request.url = f'{self.url_prefix}{request.url}'
+
+    def _restore_url_prefix(self, request: Request, response: Response):
+        """
+        Extract response cookies against the original URL and restore it.
+        Should be called after the handler returns a response (or raises HTTPError).
+        """
+        if not self.url_prefix:
+            return
+
+        original_url = self._strip_url_prefix(request.url, self.url_prefix)
+        cookiejar = self.cookiejar
+
+        # Extract Set-Cookie headers from the response and store them
+        # against the original URL so that cookie domain matching works
+        if cookiejar and response.headers.get_all('Set-Cookie'):
+            fake_request = urllib.request.Request(original_url)
+
+            class _CookieResponse:
+                def info(self):
+                    return response.headers
+
+            fake_response = _CookieResponse()
+            fake_response.url = original_url
+            cookiejar.extract_cookies(fake_response, fake_request)
+
+        request.url = original_url
+
     def send(self, request: Request) -> Response:
         """
         Passes a request onto a suitable RequestHandler
@@ -101,9 +162,8 @@ class RequestDirector:
 
         assert isinstance(request, Request)
 
-        # Add url_prefix to request url
-        if self.url_prefix:
-            request.url = f'{self.url_prefix}{request.url}'
+        # Apply url_prefix while preserving cookie domain matching
+        self._prepare_url_prefix(request)
 
         unexpected_errors = []
         unsupported_errors = []
@@ -120,6 +180,9 @@ class RequestDirector:
             self._print_verbose(f'Sending request via "{handler.RH_NAME}"')
             try:
                 response = handler.send(request)
+            except HTTPError as e:
+                self._restore_url_prefix(request, e.response)
+                raise
             except RequestError:
                 raise
             except Exception as e:
@@ -130,6 +193,7 @@ class RequestDirector:
                 continue
 
             assert isinstance(response, Response)
+            self._restore_url_prefix(request, response)
             return response
 
         raise NoSupportingHandlers(unsupported_errors, unexpected_errors)

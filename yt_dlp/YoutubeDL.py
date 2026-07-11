@@ -4353,7 +4353,7 @@ class YoutubeDL:
         clean_headers(headers)
         clean_proxies(proxies, headers)
 
-        director = RequestDirector(url_prefix=self.params.get('url_prefix'), logger=logger, verbose=self.params.get('debug_printtraffic'))
+        director = RequestDirector(url_prefix=self.params.get('url_prefix'), logger=logger, verbose=self.params.get('debug_printtraffic'), cookiejar=self.cookiejar)
         for handler in handlers:
             director.add_handler(handler(
                 logger=logger,
